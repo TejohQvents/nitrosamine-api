@@ -2,129 +2,167 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Allows WordPress frontend to access this API
+CORS(app)
 
 @app.route('/assess', methods=['POST'])
 def assess_risk():
-    data = request.json
-    responses = data.get("responses", {})
+    responses = request.get_json()
 
-    # ===== 1. LN Level Evaluation =====
-    ln = "LN4"  # Default
-
-    group1_answers = [responses.get(f"group1_q{i}") for i in range(1, 6)]
-    if "Yes" in group1_answers:
-        ln = "LN1"
-    elif "Don't Know" in group1_answers:
-        ln = "LN2"
-
-    # Group 3 water source
-    if responses.get("group3_q1") in ["Yes", "Don't Know"] and responses.get("group3_q2") == "Potable":
-        ln = "LN3" if ln == "LN4" else ln  # Don't downgrade if higher level already
-
-    # Group 7 logic for Nitrite
-    if (
-        (responses.get("group7_q1") == "Yes" and responses.get("group7_q2") == "Yes") or
-        (responses.get("group7_q1") == "Don't Know" and responses.get("group7_q2") in ["Yes", "Don't Know"])
-    ):
-        ln = "LN3" if ln == "LN4" else ln
-
-    # ===== 2. LA Level Evaluation =====
-    la = "LA4"  # Default
-
-    # Group 1 subgroup questions (secondary/tertiary amines)
-    subgroup1 = [responses.get(f"group1_subq{i}") for i in range(1, 6)]
-    if "Yes" in subgroup1:
-        la = "LA1"
-    elif "Don't Know" in subgroup1:
-        la = "LA2"
-
-    # Group 4
-    g4 = responses.get("group4_q1")
-    if g4 == "Yes":
-        la = "LA1"
-    elif g4 == "Don't Know" and la != "LA1":
-        la = "LA2"
-
-    # Group 5
-    g5 = responses.get("group5_q1")
-    if g5 == "Yes" and la not in ["LA1"]:
-        la = "LA2"
-    elif g5 == "Don't Know" and la not in ["LA1", "LA2"]:
-        la = "LA3"
-
-    # Group 6
-    g6 = responses.get("group6_q1")
-    if g6 == "Yes" and la not in ["LA1"]:
-        la = "LA2"
-    elif g6 == "Don't Know" and la not in ["LA1", "LA2"]:
-        la = "LA3"
-
-    # Group 7 logic for amine
-    g7_1 = responses.get("group7_q1")
-    g7_2 = responses.get("group7_q2")
-    if g7_1 == "Yes" and g7_2 == "Yes" and la not in ["LA1"]:
-        la = "LA2"
-    elif g7_1 == "Don't Know" and g7_2 in ["Yes", "Don't Know"] and la not in ["LA1", "LA2"]:
-        la = "LA3"
-
-    # Group 3 ion exchange water source (amine)
-    if responses.get("group3_q1") in ["Yes", "Don't Know"] and responses.get("group3_q2") == "Ion-exchange":
-        la = "LA3" if la == "LA4" else la
-
-    # ===== 3. Nitrosamine Risk Evaluation =====
-    risk = "nil"
-
-    if ln == "LN1" and la == "LA1" and responses.get("group1_same_step") == "Yes":
-        risk = "high"
-    elif (ln == "LN1" and la == "LA1") or (ln == "LN1" and la == "LA2") or (ln == "LN2" and la in ["LA1", "LA2"]):
-        risk = "moderate"
-    elif (ln in ["LN1", "LN2", "LN3"] and la == "LA3") or (la in ["LA1", "LA2", "LA3"] and ln == "LN3"):
-        risk = "minor"
-
-    # Chloramine-based minor risk triggers
-    if responses.get("group3_q3") == "Yes" or responses.get("group7_q3") == "Yes":
-        if risk == "nil":
-            risk = "minor"
-
-    # Group 7 logic for nitrosamine risk
-    if (
-        (g7_1 == "Yes" and g7_2 == "Yes") or
-        (g7_1 == "Don't Know" and g7_2 in ["Yes", "Don't Know"])
-    ):
-        if risk == "nil":
-            risk = "minor"
-    elif g7_1 == "No" or g7_2 == "No":
-        pass  # do not escalate risk
-
-    # ===== 4. Carryover Potential =====
+    ln = calculate_ln(responses)
+    la = calculate_la(responses)
+    risk = calculate_nitrosamine_risk(responses, ln, la)
     carry_nitrites = "Yes" if ln in ["LN1", "LN2"] else "No"
     carry_amines = "Yes" if la in ["LA1", "LA2"] else "No"
+    recommendations = generate_recommendations(risk, carry_nitrites, carry_amines)
 
-    # ===== 5. Recommended Actions =====
-    actions = []
-
-    if risk == "high":
-        actions.append("Nitrosamine Risk (High): Identify potential nitrosamine impurity, evaluate batches for nitrosamines, and establish scientifically sound specifications to ensure no carryover into the drug product.")
-    elif risk in ["moderate", "minor"]:
-        actions.append(f"Nitrosamine Risk ({risk.title()}): Identify potential nitrosamine impurity, evaluate batches for nitrosamines, and establish scientifically sound specifications to ensure no carryover into the drug product. If specifications are not implemented, monitor batches annually. No out-of-specification results should occur.")
-    elif risk == "nil":
-        actions.append("Nitrosamine Risk (Nil): No further action required. Document the assessment and perform periodic reassessment.")
-
-    if carry_nitrites == "Yes":
-        actions.append("Carryover of Nitrites: Assess the risk of nitrosamine or NDSRI formation in the drug product due to nitrite carryover.")
-
-    if carry_amines == "Yes":
-        actions.append("Carryover of Secondary/Tertiary Amines: Assess the risk of nitrosamine or NDSRI formation in the drug product due to amine carryover.")
-
-    if risk == "nil" and carry_nitrites == "No" and carry_amines == "No":
-        actions.append("Overall: No immediate action required.")
+    group4_disabled = any((responses.get(f"group1_q{i}") or "").lower() in ["yes", "dont know"] for i in range(1, 6))
 
     return jsonify({
-        "ln": ln,
-        "la": la,
-        "risk": risk,
-        "carryNitrites": carry_nitrites,
-        "carryAmines": carry_amines,
-        "recommendedActions": actions
-    })
+    "ln": ln,
+    "la": la,
+    "risk": risk,
+    "carryNitrites": carry_nitrites,
+    "carryAmines": carry_amines,
+    "recommendedActions": recommendations,
+    "group4_disabled": group4_disabled  # ✅ Include this for preview placeholder
+})
+
+
+# --- Logic Functions ---
+
+def calculate_ln(data):
+    # Group 1 (LN1 / LN2)
+    ln = "LN4"
+    for i in range(1, 6):
+        val = data.get(f"group1_q{i}", "").lower()
+        if val == "yes":
+            return "LN1"
+        elif val == "dont know" and ln != "LN1":
+            ln = "LN2"
+
+    # Group 3: Water used + potable = LN3
+    if data.get("group3_q1", "").lower() in ["yes", "dont know"] and data.get("group3_q2", "").lower() == "potable":
+        if ln not in ["LN1", "LN2"]:
+            ln = "LN3"
+
+    # Group 7 Nitrites
+    g71 = data.get("group7_q1", "").lower()
+    g72 = data.get("group7_q2", "").lower()
+    if (
+        (g71 == "yes" and g72 == "yes") or
+        (g71 == "dont know" and g72 in ["yes", "dont know"])
+    ) and ln == "LN4":
+        ln = "LN3"
+
+    return ln
+
+def calculate_la(data):
+    la_flags = {"LA1": False, "LA2": False, "LA3": False}
+
+    # Group 1 subquestions
+    for i in range(1, 6):
+        for j in ["_1", "_2"]:
+            val = data.get(f"group1_q{i}{j}", "").lower()
+            if val == "yes":
+                la_flags["LA1"] = True
+            elif val == "dont know":
+                la_flags["LA2"] = True
+
+    # Group 3 ion-exchange water
+    if data.get("group3_q1", "").lower() in ["yes", "dont know"] and data.get("group3_q2", "").lower() == "ion_exchange":
+        la_flags["LA3"] = True
+
+    # Group 4
+    g4 = data.get("group4_q1", "").lower()
+    if g4 == "yes":
+        la_flags["LA1"] = True
+    elif g4 == "dont know":
+        la_flags["LA2"] = True
+
+    # Group 5
+    g5 = data.get("group5_q1", "").lower()
+    if g5 == "yes":
+        la_flags["LA2"] = True
+    elif g5 == "dont know":
+        la_flags["LA3"] = True
+
+    # Group 6
+    g6 = data.get("group6_q1", "").lower()
+    if g6 == "yes":
+        la_flags["LA2"] = True
+    elif g6 == "dont know":
+        la_flags["LA3"] = True
+
+    # Group 7
+    g71 = data.get("group7_q1", "").lower()
+    g72 = data.get("group7_q2", "").lower()
+    if (
+        (g71 == "yes" and g72 == "yes") or
+        (g71 == "dont know" and g72 in ["yes", "dont know"])
+    ):
+        la_flags["LA3"] = True
+
+    if la_flags["LA1"]:
+        return "LA1"
+    if la_flags["LA2"]:
+        return "LA2"
+    if la_flags["LA3"]:
+        return "LA3"
+    return "LA4"
+
+def calculate_nitrosamine_risk(data, ln, la):
+    same_step = any(data.get(f"group1_q{i}_1", "").lower() == "yes" for i in range(1, 6))
+    chloramine_water = data.get("group3_q3", "").lower() == "yes"
+    chloramine_equip = data.get("group7_q3", "").lower() == "yes"
+    g71 = data.get("group7_q1", "").lower()
+    g72 = data.get("group7_q2", "").lower()
+
+    # Group 7 rule
+    group7_minor = (
+        (g71 == "yes" and g72 in ["yes", "dont know"]) or
+        (g71 == "dont know" and g72 in ["yes", "dont know"])
+    )
+    if g72 == "no" or g71 == "no":
+        group7_minor = False
+
+    if ln == "LN1" and la == "LA1" and same_step:
+        return "high"
+    if (
+        (ln == "LN1" and la == "LA1") or
+        (ln == "LN1" and la == "LA2") or
+        (ln == "LN2" and la in ["LA1", "LA2"])
+    ):
+        return "moderate"
+    if (
+        (ln == "LN3" and la in ["LA1", "LA2", "LA3"]) or
+        (la == "LA3" and ln in ["LN1", "LN2", "LN3"]) or
+        group7_minor or
+        ((ln == "LN4" and la == "LA4") and (chloramine_water or chloramine_equip))
+    ):
+        return "minor"
+    return "nil"
+
+def generate_recommendations(risk, carry_nitrites, carry_amines):
+    actions = "<h2>Recommended Actions Based on Assessment</h2><ul>"
+
+    # Risk-based
+    if risk == "high":
+        actions += "<li><strong>Nitrosamine Risk (High):</strong> Identify potential nitrosamine impurity and evaluate batches for nitrosamine impurity. Establish scientifically sound specifications for nitrosamines in the excipient such that carryover into the drug product will not cause product failure.</li>"
+    elif risk in ["moderate", "minor"]:
+        actions += f"<li><strong>Nitrosamine Risk ({risk.capitalize()}):</strong> Identify potential nitrosamine impurity and evaluate batches for nitrosamine impurity. If detectable amounts are observed establish scientifically sound specification limits for the nitrosamines in the excipient such that carryover into the drug product will not cause product failure. If specifications and regular monitoring is not warranted, monitor representative batches annually. No out-of-specification results shall occur or else enhance controls.</li>"
+    elif risk == "nil":
+        actions += "<li><strong>Nitrosamine Risk (Nil):</strong> No further action required. Document the assessment and perform periodic reassessment.</li>"
+
+    # Carryover
+    if carry_nitrites == "Yes":
+        actions += "<li><strong>Carryover of Nitrites:</strong> Assess the risk of nitrosamine or NDSRI formation in the drug product due to nitrite carryover.</li>"
+    if carry_amines == "Yes":
+        actions += "<li><strong>Carryover of Secondary/Tertiary Amines:</strong> Assess the risk of nitrosamine or NDSRI formation in the drug product due to amine carryover.</li>"
+    if risk == "nil" and carry_nitrites == "No" and carry_amines == "No":
+        actions += "<li><strong>Overall:</strong> No immediate action required.</li>"
+
+    actions += "</ul>"
+    return actions
+
+if __name__ == "__main__":
+    app.run(debug=True)
