@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>SQC Tool - Backend Integrated</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .form-section { margin-bottom: 30px; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+    th { background-color: #f2f2f2; }
+    canvas { margin-bottom: 50px; max-width: 100%; height: 300px; width: 755px; }
+    .chart-canvas { width: 755px; height: 300px; }
+    .chart-container h3 { text-align: center; margin-bottom: 10px; }
+    .highlight { color: red; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div id="sqc-tool">
+    <h2>Continuous Process Verification (CPV Beta Version)</h2>
+
+    <div class="form-section">
+      <label>Product Name: <input type="text" id="productName" /></label>
+      <label>Product Code: <input type="text" id="productCode" /></label>
+    </div>
+
+    <div class="form-section">
+      <h3>Enter Parameters and Specification Limits</h3>
+      <table>
+        <thead><tr><th>Parameter</th><th>LSL</th><th>USL</th></tr></thead>
+        <tbody id="paramData"></tbody>
+      </table>
+      <button onclick="addParamRow()">Add Parameter</button>
+      <p>(Up to 5 parameters)</p>
+    </div>
+
+    <div class="form-section">
+      <label>Number of Batches for Control Limits (Locking Point, 10-25): <input type="number" id="lockPoint" min="10" max="25" value="10" /></label>
+    </div>
+
+    <div class="form-section">
+      <h3>Enter Batch Data</h3>
+      <table id="batchTable">
+        <thead><tr id="batchHeader"><th>Batch No</th></tr></thead>
+        <tbody id="batchData"></tbody>
+      </table>
+      <button onclick="addBatchRow()">Add Batch</button>
+    </div>
+
+    <div class="form-section">
+      <button onclick="calculateBackendSQC()">Submit</button>
+      <p id="errorMsg" style="color:red;"></p>
+    </div>
+
+    <div id="resultSection"></div>
+    <div id="chartsSection"></div>
+  </div>
+
+  <div style="margin-top: 30px;">
+  <button onclick="downloadReport()">📥 Download Report</button>
+</div>
+
+
+<script>
+function sanitizeId(name) {
+  return name.toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+}
+
+function addParamRow() {
+  const table = document.getElementById('paramData');
+  if (table.children.length >= 5) {
+    alert('Maximum 5 parameters allowed.');
+    return;
+  }
+  const row = document.createElement('tr');
+  row.innerHTML = '<td><input type="text" name="paramName" /></td>' +
+                  '<td><input type="number" step="any" name="paramLSL" /></td>' +
+                  '<td><input type="number" step="any" name="paramUSL" /></td>';
+  table.appendChild(row);
+}
+
+function updateBatchHeader() {
+  const headerRow = document.getElementById('batchHeader');
+  headerRow.innerHTML = '<th>Batch No</th>';
+  const parameterNames = Array.from(document.querySelectorAll('input[name="paramName"]')).map(i => i.value.trim());
+  parameterNames.forEach(name => {
+    headerRow.innerHTML += `<th>${name}</th>`;
+  });
+}
+
+function addBatchRow() {
+  const table = document.getElementById('batchData');
+  const parameterNames = Array.from(document.querySelectorAll('input[name="paramName"]')).map(i => i.value.trim());
+  if (parameterNames.length == 0 || parameterNames.some(n => n === '')) {
+    alert('Please define all parameter names before adding batches.');
+    return;
+  }
+  const parameterIds = parameterNames.map(sanitizeId);
+  updateBatchHeader();
+
+  const row = document.createElement('tr');
+  row.innerHTML = `<td><input type="text" class="batchLabel" /></td>` +
+    parameterIds.map(id => `<td><input type="number" step="any" class="${id}" /></td>`).join('');
+  table.appendChild(row);
+}
+
+async function calculateBackendSQC() {
+  const lockPoint = parseInt(document.getElementById("lockPoint").value);
+  const parameterRows = Array.from(document.querySelectorAll("#paramData tr"));
+  const paramNames = parameterRows.map(r => r.querySelector("input[name='paramName']").value.trim());
+  const uslValues = parameterRows.map(r => parseFloat(r.querySelector("input[name='paramUSL']").value));
+  const lslValues = parameterRows.map(r => parseFloat(r.querySelector("input[name='paramLSL']").value));
+
+  const batchRows = Array.from(document.querySelectorAll("#batchData tr"));
+  const batches = batchRows.map(row => {
+    return paramNames.map(name => {
+      const id = name.toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+      return parseFloat(row.querySelector(`.${id}`)?.value || 'NaN');
+    });
+  });
+
+  const response = await fetch("/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paramNames, uslValues, lslValues, batches, lockPoint })
+  });
+
+  const result = await response.json();
+
+  if (result.error) {
+    document.getElementById("errorMsg").textContent = result.error;
+    return;
+  }
+
+  document.getElementById("errorMsg").textContent = "";
+  document.getElementById("resultSection").innerHTML = result.metricsHtml;
+  document.getElementById("chartsSection").innerHTML = "";
+
+  result.charts.forEach((chart) => {
+    const id = chart.parameter.toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+    chart.values.forEach((val, rowIdx) => {
+      const row = batchRows[rowIdx];
+      if (!row) return;
+      const input = row.querySelector(`.${id}`);
+      if (!input) return;
+      if (!isNaN(val) && (val < chart.lsl || val > chart.usl)) {
+        input.classList.add("highlight");
+      } else {
+        input.classList.remove("highlight");
+      }
+    });
+
+    drawChart(chart);
+  });
+}
+
+function drawChart(chart) {
+  const { parameter, values, mean, lcl, ucl, lsl, usl, shiftFlags, driftFlags } = chart;
+  const container = document.createElement("div");
+  container.classList.add("chart-container");
+
+  const title = document.createElement("h3");
+  title.textContent = `${parameter} Control Chart`;
+  title.style.textAlign = "center";
+  container.appendChild(title);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = 755;
+  canvas.height = 300;
+  container.appendChild(canvas);
+  document.getElementById("chartsSection").appendChild(container);
+
+  const labels = values.map((_, i) => `Batch ${i + 1}`);
+  const pointColors = values.map((v, i) => (v < lcl || v > ucl) ? "red" : "blue");
+  const segmentColors = values.map((_, i) => shiftFlags[i] ? "violet" : driftFlags[i] ? "red" : "blue");
+
+  new Chart(canvas.getContext("2d"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: parameter,
+          data: values,
+          borderColor: "blue",
+          pointBackgroundColor: pointColors,
+          pointRadius: 5,
+          fill: false,
+          tension: 0.3,
+          segment: {
+            borderColor: ctx => segmentColors[ctx.p0DataIndex]
+          }
+        },
+        { label: "Center Line", data: Array(values.length).fill(mean), borderColor: "gray", borderDash: [4, 4], pointRadius: 0 },
+        { label: "USL", data: Array(values.length).fill(usl), borderColor: "green", borderDash: [5, 5], pointRadius: 0 },
+        { label: "LSL", data: Array(values.length).fill(lsl), borderColor: "green", borderDash: [5, 5], pointRadius: 0 },
+        ...(ucl <= usl ? [{ label: "UCL", data: Array(values.length).fill(ucl), borderColor: "orange", borderDash: [5, 5], pointRadius: 0 }] : []),
+        ...(lcl >= lsl ? [{ label: "LCL", data: Array(values.length).fill(lcl), borderColor: "orange", borderDash: [5, 5], pointRadius: 0 }] : [])
+      ]
+    },
+    options: {
+      responsive: false,
+      plugins: { legend: { display: true }, tooltip: { enabled: true } },
+      scales: { y: { beginAtZero: false } },
+      animation: false
+    }
+  });
+}
+
+function downloadReport() {
+  const productName = document.getElementById("productName").value.trim();
+  const productCode = document.getElementById("productCode").value.trim();
+  const today = new Date().toLocaleDateString("en-GB", {
+    day: '2-digit', month: 'long', year: 'numeric'
+  });
+
+  const reportWindow = window.open('', '', 'width=900,height=1000');
+  const charts = document.querySelectorAll("canvas");
+
+  let chartImgs = "";
+  charts.forEach((canvas, i) => {
+    const imgData = canvas.toDataURL("image/png");
+    chartImgs += `<div style="text-align:center;"><img src="${imgData}" style="width:755px;height:300px;margin-bottom:20px;" /></div>`;
+  });
+
+  const content = `
+    <html>
+    <head>
+      <title>CPV Report</title>
+      <style>
+        body { font-family: Arial, sans-serif; padding: 40px 40px 80px 40px; position: relative; }
+        h2, h3 { text-align: center; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+        th { background-color: #f2f2f2; }
+        img { display: block; margin: 10px auto; }
+
+        @media print {
+          body { counter-reset: page; }
+          .footer {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            font-size: 12px;
+            color: #888;
+            padding: 10px 40px;
+            border-top: 1px solid #ccc;
+            display: flex;
+            justify-content: space-between;
+          }
+
+          .pagenum::after {
+            counter-increment: page;
+            content: "Page " counter(page);
+          }
+        }
+
+        .footer {
+          position: fixed;
+          bottom: 0;
+          width: 100%;
+          font-size: 12px;
+          color: #888;
+          padding: 10px 40px;
+          border-top: 1px solid #ccc;
+          display: flex;
+          justify-content: space-between;
+        }
+      </style>
+    </head>
+    <body>
+      <h2>Continuous Process Verification Report</h2>
+      <p><strong>Product Name:</strong> ${productName}</p>
+      <p><strong>Product Code:</strong> ${productCode}</p>
+      ${document.getElementById("resultSection").innerHTML}
+      ${chartImgs}
+      <div class="footer">
+        <div>This report was generated on ${today} with the Qvents CPV Tool</div>
+        <div class="pagenum"></div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  reportWindow.document.open();
+  reportWindow.document.write(content);
+  reportWindow.document.close();
+
+  reportWindow.onload = () => reportWindow.print();
+}
+
+
+
+</script>
+</body>
+</html>
